@@ -457,7 +457,6 @@ Total =x^(z-1) *y，已知 x=1280，y=15：
 count() 是一个聚合函数，函数的参数不仅可以是字段名，也可以是其他任意表达式，该函数作用是**<font color='cornflowerblue'>统计符合查询条件的记录中，函数指定的参数不为 NULL 的记录有多少个</font>**。
 
 - **count(\*) 执行过程跟 count(1) 执行过程基本一样的**，性能没有什么差异。
-
 - **count(主键字段)需要遍历索引读取主键值**，根据主键值是否为NULL来增加计数；而count(\*) 和 count(1) 虽然也遍历索引，不需要读取任何字段的值，所以速度更快。
 - **count(普通字段)** 由于该字段不是索引，所以必须通过全局扫描的方式，性能最差。
 
@@ -834,6 +833,359 @@ MySQL中（InnoDB引擎）行级锁**<font color='cornflowerblue'>加锁的对�
 
 - 表比较大，需要对表中全部或大部分数据进行更新；
 - 事务涉及到多个表，比较复杂，行锁可能会引起死锁，导致事务大量回滚。
+
+## 五、MySQL日志
+
+### 5.1 MySQL中有哪些日志？
+
+MySQL中主要有三种日志：undo log（回滚日志）、redo log（重做日志）、binlog（归档日志），简单介绍：
+
+- **undo log（回滚日志）**：InnoDB存储引擎层生成的日志，保证事务中的**原子性**，用于**事务回滚和MVCC**；
+- **redo log（重做日志）**：InnoDB存储引擎层生成的日志，保证事务中的**持久性**，用于**掉电等故障恢复**；
+- **binlog（归档日志）**：Server层生成的日志，用于**数据备份和主从复制**。
+
+### 5.2 为什么需要undo log？
+
+#### 5.2.1 undo log是什么？
+
+当事务对数据库进行更新（插入、修改、删除）时，MySQL会记录**<font color='cornflowerblue'>更新前的数据到undo log文件中</font>**，当事务回滚时，可以利用undo log来实现。如图：
+
+<img src="G:\code\study\CppStudy\docs\figures\回滚事务.png" alt="回滚事务" style="zoom:80%;" />
+
+每当 InnoDB 引擎对一条记录进行操作（修改、删除、新增）时，要把回滚时需要的信息都记录到 undo log 里，比如：
+
+- 在**插入**一条记录时，要把这条记录的主键值记下来，这样之后回滚时只需要把这个主键值对应的记录**删掉**就好了；
+- 在**删除**一条记录时，要把这条记录中的内容都记下来，这样之后回滚时再把由这些内容组成的记录**插入**到表中就好了；
+- 在**更新**一条记录时，要把被更新的列的旧值记下来，这样之后回滚时再把这些列**更新为旧值**就好了。
+
+不同的操作，需要记录的内容也是不同的，所以不同类型的操作（修改、删除、新增）产生的 undo log 的格式也是不同的。
+
+#### 5.2.2 undo log的两大作用？
+
+除了事务回滚作用。前面提到，MySQL中一个记录的真实数据中有几个隐藏字段，包括 roll_pointer 指针和一个 trx_id 事务id。
+
+- 通过 trx_id 可以知道该记录是被哪个事务修改的；
+- 通过 roll_pointer 指针可以将这些 undo log 串成一个链表，**这个链表就被称为<font color='cornflowerblue'>版本链</font>**；
+
+<img src="G:\code\study\CppStudy\docs\figures\版本链.png" style="zoom:80%;" />
+
+通过trx_id 和版本链，利用**<font color='cornflowerblue'>ReadView + undo log 可以实现MVCC（多版本并发控制）</font>**。
+
+「事务的 Read View 里的字段」和「记录中的两个隐藏列（trx_id 和 roll_pointer）」的比对，如果不满足可见性，就会**<font color='cornflowerblue'>顺着 undo log 版本链里找到满足其可见性的记录</font>**，从而控制并发事务访问同一个记录时的行为，这就叫 MVCC（多版本并发控制）。
+
+因此，undo log 两大作用：
+
+- <font color='cornflowerblue'>**实现事务回滚，保障事务的原子性**</font>。事务处理过程中，如果出现了错误或者用户执 行了 ROLLBACK 语句，MySQL 可以利用 undo log 中的历史数据将数据恢复到事务开始之前的状态。
+- **<font color='cornflowerblue'>实现 MVCC（多版本并发控制）关键因素之一</font>**。MVCC 是通过 ReadView + undo log 实现的。undo log 为每条记录保存多份历史数据，MySQL 在执行快照读（普通 select 语句）的时候，会根据事务的 Read View 里的信息，顺着 undo log 的版本链找到满足其可见性的记录。
+
+### 5.3 为什么需要redo log？
+
+#### 5.3.1 认识Buffer Pool
+
+MySQL的数据是保存在磁盘的，但是频繁的进行磁盘I/O会影响性能。因此，InnoDB存储引擎设计了一个**<font color='cornflowerblue'>缓冲池（Buffer Pool）</font>**，提高数据库的读写性能。
+
+<img src="G:\code\study\CppStudy\docs\figures\缓冲池.drawio.png" alt="Buffer Poo" style="zoom:60%;" />
+
+有了 Buffer Poo 后：
+
+- 当读取数据时，如果数据存在于 Buffer Pool 中，客户端就会**直接读取 Buffer Pool 中的数据**，否则再去磁盘中读取。
+- 当修改数据时，如果数据存在于 Buffer Pool 中，那直接修改 Buffer Pool 中数据所在的页，然后将其页设置为**<font color='cornflowerblue'>脏页（该页的内存数据和磁盘上的数据已经不一致）</font>**，为了减少磁盘I/O，不会立即将脏页写入磁盘，后续**由后台线程选择一个合适的时机将脏页写入到磁盘**。
+
+这样可以显著提高数据库的性能。
+
+#### 5.3.2 Buffer Pool缓存什么？
+
+由于InnoDB存储引擎中，使用**<font color='cornflowerblue'>「页」作为磁盘与内存交互的基本单位</font>**。因此Buffer Pool中也是由页组成的，在 MySQL 启动的时候，**InnoDB 会为 Buffer Pool 申请一片连续的内存空间，然后按照默认的`16KB`的大小划分出一个个的页， Buffer Pool 中的页就叫做<font color='cornflowerblue'>缓存页</font>**。初始时，这些缓存页都是空闲的，之后随着程序的运行，才会有磁盘上的页被缓存到 Buffer Pool 中。
+
+<img src="G:\code\study\CppStudy\docs\figures\bufferpool内容.drawio.png" alt="img" style="zoom:80%;" />
+
+Buffer Pool 除了缓存**<font color='cornflowerblue'>「索引页」和「数据页」</font>**，还包括了 **<font color='cornflowerblue'>Undo 页，插入缓存页、自适应哈希索引、锁信息</font>**等等。
+
+> **数据库更新时，undo log 就是写入 Buffer Pool 中的 Undo 页面中的。**
+
+Buffer Pool 和磁盘交换的**单位是页**，当我们查询一条记录时，InnoDB 是会把整个页的数据加载到 Buffer Pool 中，将页加载到 Buffer Pool 后，再通过页里的「页目录」去定位到某条具体的记录。
+
+#### 5.3.3 redo log是什么？
+
+Buffer Pool 是基于内存的，而内存总是不可靠，万一**断电重启，还没来得及落盘的脏页数据就会丢失**。因此，当有一条记录需要更新时，InnoDB首先更新内存，并将这个Buffer Pool页面标记为脏页，然后**<font color='cornflowerblue'>把本次对这个页的修改以redo log的形式记录下来，此时已经算是完成更新了</font>**（但实际上还没有存储到磁盘）。
+
+后续，InnoDB 引擎会在适当的时候，由后台线程将缓存在 Buffer Pool 的脏页刷新到磁盘里，这就是 **<font color='cornflowerblue'>WAL （Write-Ahead Logging）技术： MySQL 的写操作并不是立刻写到磁盘上，而是先写日志，然后在合适的时间再写到磁盘上</font>**。
+
+<img src="G:\code\study\CppStudy\docs\figures\wal.png" alt="img" style="zoom:60%;" />
+
+redo log 是**物理日志**，记录了某个数据页做了什么修改，比如**对 XXX 表空间中的 YYY 数据页 ZZZ 偏移量的地方做了AAA 更新**，每当执行一个事务就会产生这样的一条或者多条物理日志。在事务提交时，只要**<font color='cornflowerblue'>先将 redo log 持久化到磁盘即可</font>**，可以不需要等到将缓存在 Buffer Pool 里的脏页数据持久化到磁盘。
+
+当系统崩溃时，虽然脏页数据没有持久化，但是 redo log 已经持久化，接着 MySQL 重启后，可以根据 redo log 的内容，将所有数据恢复到最新的状态。
+
+#### 5.3.4 redo log和undo log的区别
+
+这两种日志是属于 InnoDB 存储引擎的日志，它们的区别在于：
+
+- redo log 记录了此次事务「**<font color='cornflowerblue'>完成后</font>**」的数据状态，记录的是更新**之后**的值；
+- undo log 记录了此次事务「**<font color='cornflowerblue'>开始前</font>**」的数据状态，记录的是更新**之前**的值；
+
+事实上，当InnoDB层更新记录时，会生成一条undo log，这个undo log会写入到Buffer Pool中的Undo页，此时这个写入过程也会被记录对应的redo log。所以，可以说：**<font color='cornflowerblue'>undo log 和数据页的刷盘（持久化到磁盘）策略是一样的，都需要通过 redo log 保证持久化。</font>**
+
+<img src="G:\code\study\CppStudy\docs\figures\事务恢复.png" alt="事务恢复" style="zoom:80%;" />
+
+#### 5.3.5 redo log 要写到磁盘，数据也要写磁盘，为什么要多此一举？
+
+写入 redo log 的方式使用了追加操作， 所以磁盘操作是**<font color='cornflowerblue'>顺序写</font>**，而写入数据需要先找到写入位置，然后才写到磁盘，所以磁盘操作是**<font color='cornflowerblue'>随机写</font>**。
+
+**磁盘的「顺序写 」比「随机写」 高效的多**，因此 redo log 写入磁盘的开销更小。
+
+至此， 针对为什么需要 redo log 这个问题我两个答案：
+
+- **<font color='cornflowerblue'>实现事务的持久性，让 MySQL 有 crash-safe 的能力</font>**，能够保证 MySQL 在任何时间段突然崩溃，重启后之前已提交的记录都不会丢失；
+- **<font color='cornflowerblue'>将写操作从「随机写」变成了「顺序写」</font>**，提升 MySQL 写入磁盘的性能。
+
+#### 5.3.6 redo log是怎么写入磁盘的？ 是直接写入吗？
+
+redo log也不是直接写入磁盘的，而是有自己的缓存：**<font color='cornflowerblue'>redo log buffer</font>**。每当产生一条 redo log 时，会先写入到 redo log buffer，后续在持久化到磁盘。redo log buffer 默认大小 16 MB，可以通过 `innodb_log_Buffer_size` 参数动态的调整大小，增大它的大小可以让 MySQL 处理「大事务」是不必写入磁盘，进而提升写 IO 性能。
+
+> **缓存在 redo log buffer 里的 redo log 还是在内存中，它什么时候刷新到磁盘？**
+
+主要有下面几个时机：
+
+- MySQL **正常关闭时**；
+- 当 redo log buffer 中记录的写入量大于 redo log buffer **内存空间的一半时**，会触发落盘；
+- InnoDB 的**后台线程每隔 1 秒**，将 redo log buffer 持久化到磁盘。
+- 每次**事务提交时**都将缓存在 redo log buffer 里的 redo log 直接持久化到磁盘（由参数 `innodb_flush_log_at_trx_commit` 参数控制）。
+
+#### 5.3.7 redo log文件写满了怎么办？
+
+默认情况下， InnoDB 存储引擎有 1 个重做日志文件组( redo log Group），「重做日志文件组」由有 2 个 redo log 文件组成。在重做日志组中，每个 **redo log File 的大小是固定且一致的**，假设每个 redo log File 设置的上限是 1 GB，那么总共就可以记录 2GB 的操作。
+
+重做日志文件组是以**<font color='cornflowerblue'>循环写</font>**的方式工作的，从头开始写，写到末尾就又回到开头，相当于一个环形。所以 InnoDB 存储引擎会先写 ib_logfile0 文件，当 ib_logfile0 文件被写满的时候，会切换至 ib_logfile1 文件，当 ib_logfile1 文件也被写满时，会切换回 ib_logfile0 文件。
+
+![重做日志文件组写入过程](G:\code\study\CppStudy\docs\figures\重做日志文件组写入过程.drawio.png)
+
+redo log 是循环写的方式，相当于一个环形，InnoDB 用 **write pos 表示 redo log 当前记录写到的位置，用 checkpoint 表示当前要擦除的位置**，如下图：
+
+<img src="G:\code\study\CppStudy\docs\figures\checkpoint.png" alt="img" style="zoom:50%;" />
+
+write pos 追上了 checkpoint，就意味着 **<font color='cornflowerblue'>redo log 文件满了，这时 MySQL 不能再执行新的更新操作，也就是说 MySQL 会被阻塞</font>**。
+
+此时**会停下来<font color='cornflowerblue'>将 Buffer Pool 中的脏页刷新到磁盘中，然后标记 redo log 哪些记录可以被擦除，接着对旧的 redo log 记录进行擦除，等擦除完旧记录腾出了空间，checkpoint 就会往后移动（图中顺时针）</font>**，然后 MySQL 恢复正常运行，继续执行新的更新操作。
+
+### 5.4 为什么需要binlog？
+
+#### 5.4.1 什么是binlog？
+
+除了InnoDB存储引擎层生成的undo log和redo log，MySQL在完成一条更新操作后，Server层还会生成一条binlog，**事务提交时会将该事务执行过程中产生的binlog统一写入binlog 文件**。
+
+最开始 MySQL 里并没有 InnoDB 引擎，MySQL 自带的引擎是 MyISAM，但是 MyISAM 没有 crash-safe 的能力，binlog 日志只能用于归档。InnoDB 是另一个公司以插件形式引入 MySQL 的，既然只依靠 binlog 是没有 crash-safe 能力的，所以 InnoDB 使用 redo log 来实现 crash-safe 能力。
+
+#### 5.4.2 redo log和binlog的区别？
+
+- **<font color='cornflowerblue'>适用对象不同</font>**：binlog是Server层实现的，所以引擎都可以使用；redo log是InnoDB引擎实现的。
+- **<font color='cornflowerblue'>文件格式不同</font>**：binlog有三种格式`statement`、`row`、`mixed`，区别如下：
+  - statement：记录修改数据的SQL语句，相当于记录了逻辑操作，因此binlog可以成为逻辑日志；
+  - row：记录数据最终被修改成什么样了，此时就不是逻辑日志了；
+  - mixed：根据不同情况自动选择使用statement模式或row模式。
+
+- **<font color='cornflowerblue'>写入方式不同</font>**：binlog 是追加写，写满一个文件就新创建一个文件继续写；redo log是循环追加写，日志空间大小固定，写满了就从头开始。
+- **<font color='cornflowerblue'>用途不同</font>**：binlog主要用于备份恢复（因为是全量记录的）、主从复制；redo log用于掉电等故障恢复（只能存一部分）
+
+> **如果不小心整个数据库的数据被删除了，能使用 redo log 文件恢复数据吗？**
+>
+> 不可以使用 redo log 文件恢复，只能使用 binlog 文件恢复。
+>
+> 因为 redo log 文件是循环写，是会边写边擦除日志的，只记录未被刷入磁盘的数据的物理日志，已经刷入磁盘的数据都会从 redo log 文件里擦除。
+>
+> binlog 文件保存的是全量的日志，也就是保存了所有数据变更的情况，理论上只要记录在 binlog 上的数据，都可以恢复，所以如果不小心整个数据库的数据被删除了，得用 binlog 文件恢复数据。
+
+#### 5.4.3 binlog什么时候刷盘？
+
+事务执行过程中，先把日志写到 binlog cache（Server 层的 cache），**事务提交的时候**，再把 binlog cache 写到 binlog 文件中。对于一个事务，**<font color='cornflowerblue'>无论这个事务有多大（比如有很多条语句），也要保证一次性写入</font>**。这是为了保证事务的原子性。
+
+**<font color='cornflowerblue'>在事务提交的时候，执行器把 binlog cache 里的完整事务写入到 binlog 文件中，并清空 binlog cache</font>**。如下图：
+
+<img src="G:\code\study\CppStudy\docs\figures\binlogcache.drawio.png" alt="binlog cach" style="zoom:80%;" />
+
+虽然每个线程有自己 binlog cache，但是最终**都写到同一个 binlog 文件**：
+
+- 图中的 write，指的就是指把日志写入到 binlog 文件，但是并没有把数据持久化到磁盘，因为数据还缓存在文件系统的 page cache 里，write 的写入速度还是比较快的，因为不涉及磁盘 I/O。
+- 图中的 fsync，才是**将数据持久化到磁盘的操作（刷盘）**，这里就会涉及磁盘 I/O，所以频繁的 fsync 会导致磁盘的 I/O 升高。
+
+MySQL提供一个 sync_binlog 参数来控制数据库的 binlog 刷到磁盘上的频率：
+
+- sync_binlog = 0 的时候，表示每次提交事务都只 write，不 fsync，后续交**<font color='cornflowerblue'>由操作系统决定何时将数据持久化到磁盘</font>**；
+- sync_binlog = 1 的时候，表示每次**<font color='cornflowerblue'>提交事务都会 write，然后马上执行 fsync</font>**；
+- sync_binlog =N(N>1) 的时候，表示每次提交事务都 write，但**<font color='cornflowerblue'>累积 N 个事务后才 fsync</font>**。
+
+### 5.5 为什么需要两阶段提交？
+
+#### 5.5.1 为什么需要两阶段提交？
+
+事务提交后，redo log和binlog都需要持久化到磁盘，但是它们是独立的逻辑，可能出现**半成功（只有一个成功持久化了）**的状态，于是两份日志之间的逻辑不一致，存在两种情况：
+
+- **如果在将 redo log 刷入到磁盘之后， MySQL 突然宕机了，而 binlog 还没有来得及写入**。
+- **如果在将 binlog 刷入到磁盘之后， MySQL 突然宕机了，而 redo log 还没有来得及写入**。
+
+ redo log 影响主库的数据，binlog 影响从库的数据，所以 redo log 和 binlog 不一致会导致**<font color='cornflowerblue'>主从环境中的数据不一致性</font>**。
+
+MySQL 为了避免出现两份日志之间的逻辑不一致的问题，使用了「两阶段提交」来解决，**<font color='cornflowerblue'>两阶段提交其实是分布式事务一致性协议，它可以保证多个逻辑操作要不全部成功，要不全部失败，不会出现半成功的状态</font>**。
+
+#### 5.5.2 两阶段提交的过程是怎样的？
+
+**两阶段提交把单个事务的提交拆分成了 2 个阶段，分别是「准备（Prepare）阶段」和「提交（Commit）阶段」**，每个阶段都由协调者（Coordinator）和参与者（Participant）共同完成。在 MySQL 的 InnoDB 存储引擎中，开启 binlog 的情况下，MySQL 会同时维护 binlog 日志与 InnoDB 的 redo log，为了保证这两个日志的一致性，MySQL 使用了**内部 XA 事务**，内部 XA 事务由 **<font color='cornflowerblue'>binlog 作为协调者，存储引擎是参与者</font>**。
+
+当客户端执行 commit 语句或者在自动提交的情况下，MySQL 内部开启一个 **<font color='cornflowerblue'>XA 事务</font>**，**分两阶段来完成 XA 事务的提交**，如下图：
+
+<img src="G:\code\study\CppStudy\docs\figures\两阶段提交.drawio.png" alt="两阶段提交" style="zoom:60%;" />
+
+事务的提交包含两个阶段，本质上就是**<font color='cornflowerblue'>将 redo log 的写入拆成了两个步骤：prepare 和 commit，中间再穿插写入binlog</font>**：
+
+- **<font color='cornflowerblue'>准备阶段（prepare）</font>**：将内部XA事务的ID写入到redo log，同时将redo log对应的事务状态设置为prepare，然后将redo log持久化到磁盘；
+- <font color='cornflowerblue'>**提交阶段（commit）**</font>：将内部XA事务的ID写入到binlog，然后将binlog持久化到磁盘。将redo log的状态设置为commit，此时该状态不需要立马持久化到磁盘中，写入到缓存区就够了。
+
+#### 5.5.3 两阶段提交如何保证数据一致的？
+
+下图中有时刻 A 和时刻 B 都有可能发生崩溃，不管是时刻 A（redo log 已经写入磁盘， binlog 还没写入磁盘），还是时刻 B （redo log 和 binlog 都已经写入磁盘，还没写入 commit 标识）崩溃，**<font color='cornflowerblue'>此时的 redo log 都处于 prepare 状态</font>**。
+
+<img src="G:\code\study\CppStudy\docs\figures\两阶段提交崩溃点.drawio.png" alt="时刻 A 与时刻 B" style="zoom:60%;" />
+
+MySQL 重启后会按顺序扫描 redo log 文件，碰到处于 prepare 状态的 redo log，就拿着 redo log 中的 XID 去 binlog 查看是否存在此 XID：
+
+- **<font color='cornflowerblue'>如果 binlog 中没有当前内部 XA 事务的 XID，说明 redolog 完成刷盘，但是 binlog 还没有刷盘，则回滚事务</font>**。对应时刻 A 崩溃恢复的情况。
+- **<font color='cornflowerblue'>如果 binlog 中有当前内部 XA 事务的 XID，说明 redolog 和 binlog 都已经完成了刷盘，则提交事务</font>**。对应时刻 B 崩溃恢复的情况。
+
+这样就可以保证 redo log 和 binlog 这两份日志的一致性了。
+
+#### 5.5.4 两阶段提交存在什么问题？
+
+两阶段提交虽然保证了两个日志文件的数据一致性，但是**性能很差**，主要有两个方面的影响：
+
+- **<font color='red'>磁盘I/O次数高</font>**：每个事务提交都会进行两次刷盘，redo log刷盘和binlog刷盘；
+- **<font color='red'>锁竞争激烈</font>**：在「多事务」的情况下，两阶段提交不能保证两者的提交顺序一致，因此，在两阶段提交的流程基础上，还需要**加一个锁**来保证提交的原子性，从而保证多事务的情况下，两个日志的提交顺序一致。
+
+#### 5.5.5 MySQL 磁盘 I/O 很高，有什么优化的方法？
+
+事务在提交的时候，需要将 binlog 和 redo log 持久化到磁盘，那么如果出现 MySQL 磁盘 I/O 很高的现象，我们可以通过**<font color='cornflowerblue'>控制一些参数（主要是指定redo log和binlog何时进行刷盘的参数）</font>**，来 **<font color='cornflowerblue'>“延迟” binlog 和 redo log 刷盘的时机</font>**，从而降低磁盘 I/O 的频率。
+
+## 六、MySQL主从复制和读写分离
+
+
+
+
+
+
+
+## 七、MySQL面试问题
+
+### 7.1 基础知识
+
+#### 7.1.1 关系型和非关系型数据库的区别？
+
+**关系型数据库（RDBMS）**：
+
+- 使用表来存储数据，由行（记录）和列（字段）组成，每个表有预定义的模式；
+- 具有严格的关系模型，适合结构化数据、高度一致性和复杂查询的场景；
+- 使用**结构化查询语言（SQL）**进行数据的插入、更新、查询和删除，支持复杂的查询、处理操作；
+- 示例：MySQL、Oracle、SQL Server。
+
+**非关系型数据库（NoSQL）**
+
+- 数据存储在**文档、键值对、图片**等多种数据模型中，通常不需要预定义的模式；
+- 没有固定的关系模型，数据结构可以灵活变化，适用于**大数据应用、实时数据处理、内容管理、社交媒体**等不需要严格关系模型和事务一致性的场景
+- 使用数据库特定的**查询语法**或API来操作数据，查询方式多样化，有时更直观和高效，读写性能更高，但不如SQL标准化
+- 示例：Redis、MongoDB。
+
+> 所谓的关系模型就是指表，因为对于一张表其结构是固定的，每一个记录都会有固定的字段值。这就是关系
+
+#### 7.1.2 什么是主键？ 什么是外键？
+
+- **主键**：是一个或多个字段（复合主键），可以**<font color='cornflowerblue'>唯一标识</font>**表中的每一行数据。每个表只能有一个主键，主键值必须唯一，不能包含NULL值。
+
+  ```mysql
+  # 创建一个名为person的表，有一个id字段，约束该字段是INT型且不能为NULL，并通过PRIMARY KEY约束其为主键字段
+  CREATE TABLE persons (
+  	id INT NOT NULL PRIMARY KEY
+  );
+  ```
+
+  对于InnoDB引擎，如果没有显式指定主键会自动创建一个隐藏的 6 字节的行 ID 作为主键。但这种隐式主键无法直接访问或使用，还是会进行全表扫描。
+
+- **外键**：用于在两个表之间建立关联的数据库约束，是另一个表的主键，可以重复，也可以是NULL，用来和其他表建立联系用的。
+
+  ```mysql
+  # FOREIGN KEY表时通过定义约束来创建外键
+  CREATE TABLE employees (
+      emp_id INT NOT NULL PRIMARY KEY,
+      id INT,
+      FOREIGN KEY (id) REFERENCES persons(id)
+  );
+  ```
+
+#### 7.1.3 为什么InnoDB使用自增id作为主键？
+
+如果不使用自增的主键，当插入新数据时，新纪录可能被查到现有索引页的中间某个位置，**<font color='cornflowerblue'>导致大量数据的频繁移动，且可能会导致页分裂，频繁的移动、分页会造成很多内存碎片</font>**。而使用自增的主键，每次**新添加的记录都是直接追加在后面的**，就不会导致记录的移动，如果空间不足，就自动新开辟一个页。
+
+#### 7.1.4 什么是表的连接？
+
+**表的连接**（Join）是SQL中用于从两个或多个表中组合数据的操作。通过连接，可以在查询中基于特定条件获取来自不同表的相关数据。表连接是**<font color='cornflowerblue'>关系型数据库的核心概念之一</font>**，主要有以下几种类型：
+
+- **内连接（JOIN、INNER JOIN）**：返回两个表中**满足连接条件**的所有匹配行。如果某个表中没有匹配行，则该行不会出现在结果集中。
+- **左连接（LEFT JOIN）**：返回左表中的所有行，以及右表中**匹配连接条件**的行。如果右表中没有匹配的行，则结果集中的该行会显示 `NULL`。
+- **右连接（RIGHT JOIN）**：返回右表中的所有行，以及左表中**匹配连接条件**的行。如果左表中没有匹配的行，则结果集中显示 `NULL`。
+- **全连接（FULL JOIN）**：（在MySQL中不直接支持，可以通过 `UNION` 实现）返回两个表中**所有满足条件和不满足条件**的行。如果某个表中没有匹配的行，则结果集中显示 `NULL`。
+- **交叉连接（CROSS JOIN）**：返回两个表的**笛卡尔积**，即将左表的每一行与右表的每一行组合在一起。
+
+#### 7.1.5 MySQL的内部构造？ 分为几部分？
+
+MySQL可以分为两层：**<font color='cornflowerblue'>Server层和存储引擎层</font>**。其中：
+
+- **<font color='cornflowerblue'>Server层负责管理连接、分析和执行SQL</font>**。包括连接器、解析器、预处理器、优化器、执行器、各种内置函数、各种功能等都是在Server层实现。
+- **<font color='cornflowerblue'>存储引擎层负责数据的存储和提取</font>**。支持InnoDB、MylSAM、Memory等多个存储引擎，默认的是InnoDB。
+
+#### 7.1.6 MySQL执行普通select语句的过程？
+
+1. **<font color='cornflowerblue'>Server层的连接器</font>**负责与客户端通过三次握手建立TCP连接，验证用户名和密码，确认权限；
+2. 对于收到的查询SQL语句，MySQL会首先去**<font color='cornflowerblue'>查询缓存（ Query Cache ）</font>**中查找，若命中则直接返回；
+3. 若没有命中缓存则需要具体执行SQL语句，首先由**<font color='cornflowerblue'>Server层的解析器</font>**对SQL语句进行解析，包括**词法解析（识别关键词）**和**语法解析（构建出SQL语法树，判断语句是否合法）**两个步骤；
+4. 解析完成后就可以去执行SQL，这一步之前需要先**<font color='cornflowerblue'>验证是否存在权限</font>**，又分为三个阶段：**预处理阶段、优化阶段和执行阶段**，也是在**Server层**完成；
+5. **<font color='cornflowerblue'>预处理阶段</font>**主要判断查询的表和字段是否存在，同时将 `*` 符号扩展为表上的所有列；
+6. **<font color='cornflowerblue'>优化阶段</font>**的目的是**将SQL语句的执行方案确定下来**，比如基于查询成本该使用那个索引，决定各个表的连接顺序等；
+7. **<font color='cornflowerblue'>执行阶段</font>**就是和存储引擎层进行交流，在数据库中执行查询方案，获得结果，并返回给客户端。
+
+#### 7.1.7 MySQL执行更新语句的过程？
+
+涉及到记录更新的SQL语句与普通的select语句执行过程在前面均一致，唯一的区别在于**<font color='cornflowerblue'>执行阶段</font>**。因为更新记录的SQL语句的执行涉及到了**redo log和binlog的日志写入和提交**。单独针对两个日志具体来说：
+
+1. 存储引擎层（InnoDB）在更新记录前，先记录**undo log**，同时将**内存中的数据更新并标记为脏页，然后把更新写到redo lo**g中，此时更新语句算是执行完毕了，因为WAL技术的存在，刷盘是异步执行的；
+2. 更新语句执行完成后，同时也在将更新内容写入到**binlog中**；
+3. 当更新事务提交，此时需要将redo log和binlog刷盘，即**两阶段提交**。
+
+### 7.2 SQL语句相关
+
+#### 7.2.1 Drop、Delete与Truncate的共同点和区别？
+
+- **Drop用来删除表**，所有的数据和元数据都会被删除，操作不能回滚；
+- **Delete用于删除表中的数据**，可以是所有记录或者是满足条件的部分记录（where），操作可以回滚；
+- **Truncate用于清空表中的所有记录**，但表结构、字段、约束、索引等保持不变，操作不能回滚，与DELETE相比，它更快并且使用的系统资源更少。
+
+### 7.3 MySQL索引相关
+
+
+
+### 7.4 MySQL事务相关
+
+
+
+### 7.5 MySQL锁相关
+
+
+
+### 7.6 MySQL日志相关
+
+
+
+### 7.5 MySQL分布式相关
+
+#### 7.5.1 分布式数据库为什么不能使用自增ID或UUID做主键？
+
+
 
 
 
