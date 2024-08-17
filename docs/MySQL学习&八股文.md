@@ -972,7 +972,7 @@ write pos 追上了 checkpoint，就意味着 **<font color='cornflowerblue'>red
 
 #### 5.4.1 什么是binlog？
 
-除了InnoDB存储引擎层生成的undo log和redo log，MySQL在完成一条更新操作后，Server层还会生成一条binlog，**事务提交时会将该事务执行过程中产生的binlog统一写入binlog 文件**。
+除了InnoDB存储引擎层生成的undo log和redo log，MySQL在完成一条更新操作后，Server层还会生成一条binlog（二进制日志，binary log），**事务提交时会将该事务执行过程中产生的binlog统一写入binlog 文件**。
 
 最开始 MySQL 里并没有 InnoDB 引擎，MySQL 自带的引擎是 MyISAM，但是 MyISAM 没有 crash-safe 的能力，binlog 日志只能用于归档。InnoDB 是另一个公司以插件形式引入 MySQL 的，既然只依靠 binlog 是没有 crash-safe 能力的，所以 InnoDB 使用 redo log 来实现 crash-safe 能力。
 
@@ -1066,7 +1066,86 @@ MySQL 重启后会按顺序扫描 redo log 文件，碰到处于 prepare 状态�
 
 ## 六、MySQL主从复制和读写分离
 
+### 6.1 什么是主从复制？
 
+数据量都比较大，而单台数据库在数据存储、安全性和高并发方面都无法满足实际的需求，所以需要配置多台主从数据服务器。
+
+MySQL 主从复制是数据库**高可用性架构**中的一种常见实现方式，将数据从**MySQL数据库服务器（主服务器）**复制到**一个或多个MySQL数据库服务器（从服务器）**，目的是能够实现数据的备份、读写分离、负载均衡等，提高MySQL服务的可用性。
+
+MySQL 主从复制通常采用一主多从的拓扑结构，所有的数据**<font color='cornflowerblue'>写操作都在主服务器上执行</font>**，而从服务器主要用于处理**<font color='cornflowerblue'>读操作和备份</font>**。
+
+### 6.2 主从复制是怎么实现的？
+
+MySQL的主从复制依赖于binlog，该日志将MySQL的所有更新以二进制的形式保存在磁盘上，复制的过程就是**将binlog从主库传输到从库上**。
+
+这个过程**<font color='cornflowerblue'>一般是异步</font>**的，也就是主库上执行事务操作的线程不会等待复制 binlog 的线程同步完成。
+
+<img src="G:\code\study\CppStudy\docs\figures\主从复制过程.drawio.png" alt="MySQL 主从复制过程" style="zoom:80%;" />
+
+MySQL集群的主从复制过程可以划分为下面几个阶段：
+
+- **<font color='cornflowerblue'>写入Binlog</font>**：主库在收到提交事务的请求之后，会先写入binlog，再提交事务，更新存储引擎中的数据，返回客户端操作成功的响应；
+- **<font color='cornflowerblue'>请求Binlog</font>**：从库中有一个专门的I/O线程，用于向主库请求从指定位置之后的binlog日志内容；
+- **<font color='cornflowerblue'>同步Binlog</font>**：主库中维护了一个log dump线程，在收到binlog同步的请求后，向从库传输相应的日志数据，从库中的I/O线程收到这些数据，会将其写入到本地的**<font color='red'>relay log（中继日志）</font>**中，并返回主库接收成功的响应；
+- **<font color='cornflowerblue'>回放Binlog</font>**：从库中I/O线程接收了binlog只是放到了relay log，还维护了一个SQL线程从relay log读取新同步过来的数据，解析成SQL语句逐一执行，最终保证主从数据的一致性。
+
+<img src="G:\code\study\CppStudy\docs\figures\主从复制2.png" alt="[外链图片转存失败,源站可能有防盗链机制,建议将图片保存下来直接上传(img-dPrvD0SI-1620876295915)(E:/笔记/JAVA/Java复习框架-数据库/Mysql/temp2/5.png)]" style="zoom:80%;" />
+
+### 6.3 主从复制的几种模式？
+
+#### 6.3.1 异步模式（async-mode）
+
+MySQL主从复制**默认的模式就是异步模式**，也就是上文中的过程。主库中不会主动向从库推送binlog，并且主库自身完成客户端提交的事务后会立马响应给客户端，并**<font color='cornflowerblue'>不关心从库是否接收到新的同步日志</font>**。
+
+**<font color='red'>如果主节点突然崩溃了，可能导致更新的数据没有同步到从节点上，如果将一个从库提升为主库，会导致数据的丢失，从而产生不一致性</font>**。
+
+<img src="G:\code\study\CppStudy\docs\figures\异步模式.png" alt="[外链图片转存失败,源站可能有防盗链机制,建议将图片保存下来直接上传(img-LiYZE5yK-1620876295918)(E:/笔记/JAVA/Java复习框架-数据库/Mysql/temp2/6.png)]" style="zoom:80%;" />
+
+#### 6.3.2 同步模式 （sync-mode）
+
+同步模式中MySQL主库中**<font color='cornflowerblue'>提交事务的线程需要阻塞等待所有从库的复制成功响应，才会将结果返回给客户端</font>**。这种模式可以保证更新的数据被同步到了所有的从库中，但是在实际情况中，一般无法使用：
+
+- **性能很差**，需要等待所有从库同步完成才会响应；
+- 有一个主库或从库不可用时，**整体的服务就不可用**。
+
+#### 6.3.3 半同步模式（semi-sync）
+
+MySQL 5.7版本之后新增加了一种模式：半同步模式，介于异步模式和同步模式之间。事务线程不需要等待所有的从库都完成同步，只需要**一部分复制成功即可**。这种**<font color='cornflowerblue'>半同步复制的方式，兼顾了异步复制和同步复制的优点，即使出现主库宕机，至少还有一个从库有最新的数据，不存在数据丢失的风险</font>**。
+
+<img src="G:\code\study\CppStudy\docs\figures\半同步模式" alt="[外链图片转存失败,源站可能有防盗链机制,建议将图片保存下来直接上传(img-W6DVdDkG-1620876295920)(E:/笔记/JAVA/Java复习框架-数据库/Mysql/temp2/7.png)]" style="zoom:80%;" />
+
+#### 6.3.3 GTID模式
+
+> **什么是GTID？**
+
+GTID（Global Transaction ID，全局事务标识符）复制模式是 MySQL 中用于实现主从复制的一种**增强机制**。相比于传统的基于二进制日志位置（Binary Log Position）的复制方式，**<font color='cornflowerblue'>GTID 提供了一种更加简洁、可靠的方式来管理和跟踪主从复制的事务状态。</font>**
+
+**全局事务标识符（GTID）**：全局唯一的标识符，标记在 MySQL 主服务器上执行的每一个事务，一般来说**：<font color='cornflowerblue'>`GTID = source_id:transaction_id`</font>**，即有两个部分组成：
+
+-  `source_id` ：主服务器的唯一标识（一般是服务器的UUID）；
+- `transaction_id`：在主服务器上执行的事务的序号
+
+通过GTID，**每个事务在MySQL集群中都有唯一的GTID**，无论事务被复制到多少个从服务器，GTID总是不变的。
+
+> **GTID的工作原理？**
+
+- **事务执行**：当主服务器在执行一个事务时，会给这个事务生成一个唯一的GTID，将这GTID和事务一起记录到binlog中；
+- **日志同步**：从服务器向主服务器请求日志同步时，从服务器会向主服务器发送它已经处理的最后一个 GTID 及其 GTID 集（GTID Set），主服务器可以通过这个GTID集来确定哪些事务没有发送给从服务器；
+- **故障恢复**：在 GTID 模式下，从服务器已经记录了所有执行过的 GTID 集。当主服务器故障时，只需将从服务器提升为主服务器，无需关心具体的 binlog 文件名或位置。新的主服务器会基于其 GTID 集继续生成 binlog，而其他从服务器可以自动继续复制，无需复杂的手动介入。
+
+### 6.4 怎么实现读写分离？
+
+**<font color='cornflowerblue'>主从复制的目的是为了实现数据库的读写分离</font>**：写操作和实时性较强的读操作则访问主数据库；读操作则访问从数据库。从而使数据库具有更强大的访问负载能力，支撑更多的用户访问。
+
+
+
+
+
+### 6.5 主从复制有哪些问题？
+
+
+
+### 6.6 MySQL主从复制主流架构模型
 
 
 
@@ -1192,3 +1271,5 @@ MySQL可以分为两层：**<font color='cornflowerblue'>Server层和存储引�
 # 资料参考
 
 内容大多参考自：[图解MySQL介绍 | 小林coding (xiaolincoding.com)](https://xiaolincoding.com/mysql/)
+
+[【Mysql面试高频】- Mysql主从复制相关的面试知识点_从库读取主库的binlog线程为啥只有一个-CSDN博客](https://blog.csdn.net/Mind_programmonkey/article/details/116742748)
